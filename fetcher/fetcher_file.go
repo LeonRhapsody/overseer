@@ -1,109 +1,100 @@
-package main
+package fetcher
 
 import (
-	"compress/gzip"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
-	"net/http"
-	"strings"
+	"os"
 	"time"
 )
 
-var GlobalTransport *http.Transport
-
-//应该定义一个全局的 transport 结构体, 在多个 goroutine 之间共享.否则会占用大量的open files，引发socket: too many open files
-
-func init() { //忽略证书检验
-	GlobalTransport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		//ResponseHeaderTimeout: 2 * time.Second,//限制读取response header的时间
-		Dial: (&net.Dialer{
-			Timeout: 3 * time.Second, //限制建立tcp连接的时间
-			//KeepAlive: 30 * time.Second,
-		}).Dial,
-	}
-
-}
-
-type HTTP struct {
-	//URL to poll for new binaries
-	URL          string
-	Interval     time.Duration
-	CheckHeaders []string
-	//internal state
+// File checks the provided Path, at the provided
+// Interval for new Go binaries. When a new binary
+// is found it will replace the currently running
+// binary.
+type File struct {
+	Path     string
+	Interval time.Duration
+	// hash is the file modify time and its size
+	hash  string
 	delay bool
-	lasts map[string]string
 }
 
-//if any of these change, the binary has been updated
-var defaultHTTPCheckHeaders = []string{"ETag", "If-Modified-Since", "Last-Modified", "Content-Length"}
-
-// Init validates the provided config
-func (h *HTTP) Init() error {
-	//apply defaults
-	if h.URL == "" {
-		return fmt.Errorf("URL required")
+// Init sets the Path and Interval options
+func (f *File) Init() error {
+	if f.Path == "" {
+		return fmt.Errorf("Path required")
 	}
-	h.lasts = map[string]string{}
-	if h.Interval == 0 {
-		h.Interval = 5 * time.Minute
+	if f.Interval < 1*time.Second {
+		f.Interval = 1 * time.Second
 	}
-	if h.CheckHeaders == nil {
-		h.CheckHeaders = defaultHTTPCheckHeaders
+	if err := f.updateHash(); err != nil {
+		return err
 	}
 	return nil
 }
 
-// Fetch the binary from the provided URL
-func (h *HTTP) Fetch() (io.Reader, error) {
-	client := http.Client{Transport: GlobalTransport} //忽略证书检验
-	//delay fetches after first
-	if h.delay {
-		time.Sleep(h.Interval)
+// Fetch file from the specified Path
+func (f *File) Fetch() (io.Reader, error) {
+	//only delay after first fetch
+	if f.delay {
+		time.Sleep(f.Interval)
 	}
-	h.delay = true
-	//status check using HEAD
-
-	resp, err := client.Head(h.URL)
+	f.delay = true
+	lastHash := f.hash
+	if err := f.updateHash(); err != nil {
+		return nil, err
+	}
+	// no change
+	if lastHash == f.hash {
+		return nil, nil
+	}
+	// changed!
+	file, err := os.Open(f.Path)
 	if err != nil {
-		return nil, fmt.Errorf("HEAD request failed (%s)", err)
+		return nil, err
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HEAD request failed (status code %d)", resp.StatusCode)
-	}
-
-	//if all headers match, skip update
-	matches, total := 0, 0
-	for _, header := range h.CheckHeaders {
-		if curr := resp.Header.Get(header); curr != "" { //匹配header中描述的文件信息
-			if last, ok := h.lasts[header]; ok && last == curr {
-				matches++
-			}
-			h.lasts[header] = curr
-			total++
+	//check every 1/4s for 5s to
+	//ensure its not mid-copy
+	const rate = 250 * time.Millisecond
+	const total = int(5 * time.Second / rate)
+	attempt := 1
+	for {
+		if attempt == total {
+			file.Close()
+			return nil, errors.New("file is currently being changed")
 		}
+		attempt++
+		//sleep
+		time.Sleep(rate)
+		//check hash!
+		if err := f.updateHash(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		//check until no longer changing
+		if lastHash == f.hash {
+			break
+		}
+		lastHash = f.hash
 	}
-	if matches == total {
-		return nil, nil //skip, file match
-	}
-	log.Println("发现新文件，触发更新")
-	//binary fetch using GET
-	resp, err = client.Get(h.URL)
+	return file, nil
+}
 
+func (f *File) updateHash() error {
+	file, err := os.Open(f.Path)
 	if err != nil {
-		return nil, fmt.Errorf("GET request failed (%s)", err)
+		//binary does not exist, skip
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("Open file error: %s", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET request failed (status code %d)", resp.StatusCode)
+	defer file.Close()
+	s, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("Get file stat error: %s", err)
 	}
-	//extract gz files
-	if strings.HasSuffix(h.URL, ".gz") && resp.Header.Get("Content-Encoding") != "gzip" {
-		return gzip.NewReader(resp.Body)
-	}
-	//success!
-	return resp.Body, nil
+	f.hash = fmt.Sprintf("%d|%d", s.ModTime().UnixNano(), s.Size())
+	return nil
 }
